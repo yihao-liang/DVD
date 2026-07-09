@@ -1,19 +1,17 @@
 import argparse
 import os
+import re
+import time
 from datetime import datetime
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator
-from omegaconf import OmegaConf
-from safetensors.torch import load_file
 from tqdm import tqdm
 
 from diffsynth import save_video
-from examples.wanvideo.model_training.WanTrainingModule import \
-    WanTrainingModule
+from quant_script.common import (get_window_index, pad_time_mod4,
+                                 read_video, resize_for_training_scale)
 
 
 # =============================
@@ -43,85 +41,12 @@ def compute_scale_and_shift(curr_frames, ref_frames, mask=None):
 # =============================
 # Helper: Video Processing
 # =============================
-def read_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
-
-    cap.release()
-
-    video_np = np.stack(frames)
-    video_tensor = torch.from_numpy(
-        video_np).permute(0, 3, 1, 2).float() / 255.0
-
-    return video_tensor.unsqueeze(0), fps   # [1, T, C, H, W], fps
-
-
-def resize_for_training_scale(video_tensor, target_h=480, target_w=640):
-    B, T, C, H, W = video_tensor.shape
-    ratio = max(target_h / H, target_w / W)
-    new_H = int(np.ceil(H * ratio))
-    new_W = int(np.ceil(W * ratio))
-
-    # Align to 16
-    new_H = (new_H + 15) // 16 * 16
-    new_W = (new_W + 15) // 16 * 16
-
-    if new_H == H and new_W == W:
-        return video_tensor, (H, W)
-
-    video_reshape = video_tensor.view(B * T, C, H, W)
-    resized = F.interpolate(video_reshape, size=(
-        new_H, new_W), mode="bilinear", align_corners=False)
-    resized = resized.view(B, T, C, new_H, new_W)
-    return resized, (H, W)
-
-
 def resize_depth_back(depth_np, orig_size):
     orig_H, orig_W = orig_size
     depth_tensor = torch.from_numpy(depth_np).permute(0, 3, 1, 2).float()
     depth_tensor = F.interpolate(depth_tensor, size=(
         orig_H, orig_W), mode='bilinear', align_corners=False)
     return depth_tensor.permute(0, 2, 3, 1).cpu().numpy()
-
-
-def pad_time_mod4(video_tensor):
-    """Pads the temporal dimension to satisfy 4n+1 requirement."""
-    B, T, C, H, W = video_tensor.shape
-    remainder = T % 4
-    if remainder != 1:
-        pad_len = (4 - remainder + 1) % 4
-        pad_frames = video_tensor[:, -1:, :, :, :].repeat(1, pad_len, 1, 1, 1)
-        video_tensor = torch.cat([video_tensor, pad_frames], dim=1)
-    return video_tensor, T
-
-
-def get_window_index(T, window_size, overlap):
-    if T <= window_size:
-        return [(0, T)]
-    res = [(0, window_size)]
-    start = window_size - overlap
-    while start < T:
-        end = start + window_size
-        if end < T:
-            res.append((start, end))
-            start += window_size - overlap
-        else:
-            # Last window ensures full window_size length if possible
-            start = max(0, T - window_size)
-            res.append((start, T))
-            break
-    return res
 
 
 # =============================
@@ -133,9 +58,11 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
     print(f"depth_windows {depth_windows}")
 
     depth_res_list = []
+    window_times = []
 
     # 1. Inference per window
     for start, end in tqdm(depth_windows, desc="Inferencing Slices"):
+        _window_t0 = time.time()
         _input_rgb_slice = input_rgb[:, start:end]
 
         # Ensure 4n+1 padding
@@ -163,6 +90,14 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
         )
         # Drop the padded frames
         depth_res_list.append(outputs['depth'][:, :origin_T])
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        window_times.append(time.time() - _window_t0)
+
+    if window_times:
+        print(f"[bench] {len(window_times)} windows, "
+              f"mean {sum(window_times) / len(window_times):.3f} s/window, "
+              f"total {sum(window_times):.1f} s")
 
     # 2. Overlap Alignment
     depth_list_aligned = None
@@ -234,27 +169,11 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
 # =============================
 # Pipeline Components
 # =============================
-def load_model(ckpt_dir, yaml_args):
+def load_model(ckpt_dir, model_config_path, dit_sd=None):
     """Initializes and loads the model checkpoint."""
-    accelerator = Accelerator()
-    model = WanTrainingModule(
-        accelerator=accelerator,
-        model_id_with_origin_paths=yaml_args.model_id_with_origin_paths,
-        trainable_models=None,
-        use_gradient_checkpointing=False,
-        lora_rank=yaml_args.lora_rank,
-        lora_base_model=yaml_args.lora_base_model,
-        args=yaml_args,
-    )
-
-    ckpt_path = os.path.join(ckpt_dir, "model.safetensors")
-    state_dict = load_file(ckpt_path, device="cpu")
-    dit_state_dict = {k.replace("pipe.dit.", ""): v for k,
-                      v in state_dict.items() if "pipe.dit." in k}
-    model.pipe.dit.load_state_dict(dit_state_dict, strict=True)
-    model.merge_lora_layer()
+    from quant_script.common import build_model
+    model = build_model(ckpt_dir, model_config_path, dit_sd=dit_sd)
     model = model.to("cuda")
-    
     return model
 
 
@@ -292,6 +211,11 @@ def save_results(depth, origin_fps, args):
     out_prefix = os.path.join(
         args.output_dir, f"{base_name}_{gray_scale}")
 
+    if args.save_npy:
+        npy_path = f"{out_prefix}_depth.npy"
+        np.save(npy_path, depth)
+        print(f"Saved raw depth to {npy_path}")
+
     output_path = f"{out_prefix}_depth_vis.mp4"
     print(f"Saving to {output_path}")
     d_min, d_max = depth.min(), depth.max()
@@ -314,6 +238,20 @@ def parse_args():
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument("--overlap", type=int, default=9)
     parser.add_argument('--grayscale', action='store_true')
+    parser.add_argument("--dit_sd", type=str, default=None,
+                        help="Load a merged LoRA-free DiT state dict instead of ckpt/model.safetensors")
+    parser.add_argument("--save_npy", action="store_true",
+                        help="Also dump raw depth (T,H,W,3) as .npy next to the mp4")
+    parser.add_argument("--pseudo_quant", nargs="?", const="w4g128", default=None,
+                        help="Fake-quantize DiT block linears after loading; optional "
+                             "spec like w4g128, w4g64, w8g128 (default if flag given "
+                             "with no value: w4g128)")
+    parser.add_argument("--awq_results", type=str, default=None,
+                        help="Apply AWQ scales/clips (from run_awq_search.py) before pseudo-quant")
+    parser.add_argument("--awq_ckpt", type=str, default=None,
+                        help="Load a real packed low-bit AWQ DiT checkpoint (from "
+                             "quant_script/pack_awq.py) after loading --dit_sd; "
+                             "auto-detects the packed checkpoint format")
     return parser.parse_args()
 
 
@@ -322,16 +260,63 @@ def parse_args():
 # =============================
 def main():
     args = parse_args()
-    yaml_args = OmegaConf.load(args.model_config)
 
     # 1. Load Model
-    model = load_model(args.ckpt, yaml_args)
+    model = load_model(args.ckpt, args.model_config, dit_sd=args.dit_sd)
+
+    # 1a. Optional real packed low-bit checkpoint (built via quant_script/pack_awq.py
+    # on top of --dit_sd; replaces the just-loaded bf16 weights in place). Mutually
+    # exclusive in practice with --awq_results/--pseudo_quant (the packed checkpoint
+    # already has AWQ applied and the weights quantized).
+    assert not (args.awq_ckpt and (args.awq_results or args.pseudo_quant)), \
+        "--awq_ckpt loads an already-quantized checkpoint; do not combine it with --awq_results/--pseudo_quant (would double-quantize)."
+    if args.awq_ckpt:
+        from quant_script.load_awq import is_packed_awq_checkpoint, load_awq_dit
+        if is_packed_awq_checkpoint(args.awq_ckpt):
+            load_awq_dit(model.pipe.dit, args.awq_ckpt)
+        else:
+            raise ValueError(
+                f"{args.awq_ckpt} is not a recognized packed AWQ checkpoint format "
+                "(expected Tier-A dvd_awq_packed_v1 metadata)")
+        model.pipe.dit.cuda()
+        print(f"loaded AWQ checkpoint {args.awq_ckpt}")
+
+    # 1b. Optional quantization (model is still on CUDA at this point)
+    if args.awq_results:
+        from awq.quantize.pre_quant import apply_awq
+        apply_awq(model.pipe.dit, torch.load(args.awq_results, map_location="cpu"))
+        print(f"applied AWQ results from {args.awq_results}")
+    if args.pseudo_quant:
+        from quant_script.awq_dit import pseudo_quantize_dit
+        m = re.match(r"^w(\d+)g(\d+)$", args.pseudo_quant)
+        assert m, f"--pseudo_quant spec must look like w4g128, got {args.pseudo_quant!r}"
+        w_bit, group_size = int(m.group(1)), int(m.group(2))
+        pseudo_quantize_dit(model.pipe.dit, w_bit=w_bit,
+                            q_config=dict(zero_point=True, q_group_size=group_size))
+    if args.awq_results or args.pseudo_quant:
+        # apply_awq (apply_scale/apply_clip) and pseudo_quantize_dit each cycle
+        # the touched submodules through .cuda()/.cpu() per-layer (a pattern
+        # inherited from llm-awq's memory-frugal block-by-block search, where
+        # only the block currently being processed lives on GPU). Since our
+        # model is already fully resident on CUDA (load_model moved it there),
+        # that .cpu() tail-call stranded 510-600 of the ~825-855 DiT params on
+        # CPU while the rest of the model stayed on GPU, causing a device
+        # mismatch on the next forward pass. Moving the whole DiT back to CUDA
+        # in one shot after quantization fixes this without touching the
+        # vendored llm-awq quantization code.
+        model.pipe.dit.cuda()
 
     # 2. Load Video
     input_tensor, orig_size, origin_fps = load_video_data(args)
 
-    # 3. Predict Depth
+    # 3. Predict Depth (peak-VRAM window starts here, i.e. excludes one-time
+    # model/checkpoint loading, so bf16 vs w4/w8 runs are comparable)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     depth = predict_depth(model, input_tensor, orig_size, args)
+    if torch.cuda.is_available():
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        print(f"[bench] peak VRAM during inference: {peak_gb:.2f} GB")
 
     # 4. Save Results
     save_results(depth, origin_fps, args)
